@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout release repo
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           path: release
 
@@ -29,13 +29,116 @@ jobs:
         run: |
           set -euo pipefail
 
-          test -f release/breach_release.zip
+          ZIP="release/breach_release.zip"
+          test -f "$ZIP"
 
           rm -rf extracted
           mkdir extracted
-          unzip -q release/breach_release.zip -d extracted
+          unzip -q "$ZIP" -d extracted
 
-          test -d extracted/1_SERVER_REPO_UPLOAD
-          test -d extracted/2_CLIENT_REPO_UPLOAD
-          test -f extracted/1_SERVER_REPO_UPLOAD/worker.js
-          test -f extracted/2_CLIENT_REPO_UPLOAD/index.html
+          echo "ZIP contents:"
+          find extracted -maxdepth 3 -type f | sort | head -100
+          SERVER_DIR="$(find extracted -type d -name '1_SERVER_REPO_UPLOAD' -print -quit)"
+          CLIENT_DIR="$(find extracted -type d -name '2_CLIENT_REPO_UPLOAD' -print -quit)"
+
+          if [ -z "$SERVER_DIR" ]; then
+            echo "ERROR: 1_SERVER_REPO_UPLOAD was not found anywhere inside breach_release.zip"
+            exit 1
+          fi
+
+          if [ -z "$CLIENT_DIR" ]; then
+            echo "ERROR: 2_CLIENT_REPO_UPLOAD was not found anywhere inside breach_release.zip"
+            exit 1
+          fi
+
+          if [ ! -f "$SERVER_DIR/worker.js" ]; then
+            echo "ERROR: worker.js is missing from $SERVER_DIR"
+            exit 1
+          fi
+
+          if [ ! -f "$CLIENT_DIR/index.html" ]; then
+            echo "ERROR: index.html is missing from $CLIENT_DIR"
+            exit 1
+          fi
+
+          echo "SERVER_DIR=$SERVER_DIR" >> "$GITHUB_ENV"
+          echo "CLIENT_DIR=$CLIENT_DIR" >> "$GITHUB_ENV"
+
+          while IFS= read -r -d '' file; do
+            node --check "$file" >/dev/null
+          done < <(find "$SERVER_DIR" "$CLIENT_DIR" -name '*.js' -print0)
+
+          SERVER_VERSION="$(sed -n "s/^export const APP_VERSION = '\([^']*\)';/\1/p" "$SERVER_DIR/game-config.js")"
+          CLIENT_VERSION="$(sed -n "s/^export const APP_VERSION = '\([^']*\)';/\1/p" "$CLIENT_DIR/game-config.js")"
+
+          if [ -z "$SERVER_VERSION" ]; then
+            echo "ERROR: Could not read server APP_VERSION"
+            exit 1
+          fi
+
+          if [ "$SERVER_VERSION" != "$CLIENT_VERSION" ]; then
+            echo "ERROR: Server version $SERVER_VERSION does not match client version $CLIENT_VERSION"
+            exit 1
+          fi
+
+          echo "BREACH_VERSION=$SERVER_VERSION" >> "$GITHUB_ENV"
+          echo "Validated Breach $SERVER_VERSION"
+          echo "Server source: $SERVER_DIR"
+          echo "Client source: $CLIENT_DIR"
+
+      - name: Checkout server repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/breach-online
+          token: ${{ secrets.DEPLOY_TOKEN }}
+          path: server
+
+      - name: Checkout client repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/breach
+          token: ${{ secrets.DEPLOY_TOKEN }}
+          path: client
+
+      - name: Update server repo
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rsync -a --delete             --exclude='.git/'             --exclude='.github/'             --exclude='README.md'             "$SERVER_DIR/" server/
+
+          git -C server config user.name "breach-release-bot"
+          git -C server config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C server add -A
+
+          if ! git -C server diff --cached --quiet; then
+            git -C server commit -m "Deploy Breach ${BREACH_VERSION}"
+            git -C server push origin HEAD
+          else
+            echo "Server repo already matches Breach ${BREACH_VERSION}"
+          fi
+
+      - name: Update client repo
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rsync -a --delete             --exclude='.git/'             --exclude='.github/'             --exclude='README.md'             --exclude='CNAME'             --exclude='.nojekyll'             "$CLIENT_DIR/" client/
+
+          git -C client config user.name "breach-release-bot"
+          git -C client config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C client add -A
+
+          if ! git -C client diff --cached --quiet; then
+            git -C client commit -m "Deploy Breach ${BREACH_VERSION}"
+            git -C client push origin HEAD
+          else
+            echo "Client repo already matches Breach ${BREACH_VERSION}"
+          fi
+
+      - name: Deployment summary
+        if: always()
+        shell: bash
+        run: |
+          echo "Breach release workflow finished."
+          echo "Version: ${BREACH_VERSION:-unknown}"
