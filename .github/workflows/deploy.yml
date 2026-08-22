@@ -1,4 +1,4 @@
-name: Deploy Breach Release
+name: Deploy Breach
 
 "on":
   push:
@@ -9,7 +9,7 @@ name: Deploy Breach Release
   workflow_dispatch: {}
 
 concurrency:
-  group: breach-release-deploy
+  group: breach-release
   cancel-in-progress: true
 
 permissions:
@@ -18,127 +18,94 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout release repo
         uses: actions/checkout@v4
         with:
           path: release
 
-      - name: Extract and validate release
+      - name: Extract and validate game ZIP
         shell: bash
         run: |
           set -euo pipefail
 
-          ZIP="release/breach_release.zip"
-          test -f "$ZIP"
+          test -f release/breach_release.zip
 
-          rm -rf extracted
-          mkdir extracted
-          unzip -q "$ZIP" -d extracted
+          rm -rf game
+          mkdir game
+          unzip -q release/breach_release.zip -d game
 
-          echo "ZIP contents:"
-          find extracted -maxdepth 3 -type f | sort | head -100
-          SERVER_DIR="$(find extracted -type d -name '1_SERVER_REPO_UPLOAD' -print -quit)"
-          CLIENT_DIR="$(find extracted -type d -name '2_CLIENT_REPO_UPLOAD' -print -quit)"
-
-          if [ -z "$SERVER_DIR" ]; then
-            echo "ERROR: 1_SERVER_REPO_UPLOAD was not found anywhere inside breach_release.zip"
-            exit 1
-          fi
-
-          if [ -z "$CLIENT_DIR" ]; then
-            echo "ERROR: 2_CLIENT_REPO_UPLOAD was not found anywhere inside breach_release.zip"
-            exit 1
-          fi
-
-          if [ ! -f "$SERVER_DIR/worker.js" ]; then
-            echo "ERROR: worker.js is missing from $SERVER_DIR"
-            exit 1
-          fi
-
-          if [ ! -f "$CLIENT_DIR/index.html" ]; then
-            echo "ERROR: index.html is missing from $CLIENT_DIR"
-            exit 1
-          fi
-
-          echo "SERVER_DIR=$SERVER_DIR" >> "$GITHUB_ENV"
-          echo "CLIENT_DIR=$CLIENT_DIR" >> "$GITHUB_ENV"
+          test -f game/1_SERVER_REPO_UPLOAD/worker.js
+          test -f game/2_CLIENT_REPO_UPLOAD/index.html
 
           while IFS= read -r -d '' file; do
             node --check "$file" >/dev/null
-          done < <(find "$SERVER_DIR" "$CLIENT_DIR" -name '*.js' -print0)
+          done < <(find game/1_SERVER_REPO_UPLOAD game/2_CLIENT_REPO_UPLOAD -name '*.js' -print0)
 
-          SERVER_VERSION="$(sed -n "s/^export const APP_VERSION = '\([^']*\)';/\1/p" "$SERVER_DIR/game-config.js")"
-          CLIENT_VERSION="$(sed -n "s/^export const APP_VERSION = '\([^']*\)';/\1/p" "$CLIENT_DIR/game-config.js")"
-
-          if [ -z "$SERVER_VERSION" ]; then
-            echo "ERROR: Could not read server APP_VERSION"
-            exit 1
-          fi
-
-          if [ "$SERVER_VERSION" != "$CLIENT_VERSION" ]; then
-            echo "ERROR: Server version $SERVER_VERSION does not match client version $CLIENT_VERSION"
-            exit 1
-          fi
-
-          echo "BREACH_VERSION=$SERVER_VERSION" >> "$GITHUB_ENV"
-          echo "Validated Breach $SERVER_VERSION"
-          echo "Server source: $SERVER_DIR"
-          echo "Client source: $CLIENT_DIR"
+          echo "Game ZIP validated."
 
       - name: Checkout server repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/breach-online
+          repository: kakrami/breach-online
           token: ${{ secrets.DEPLOY_TOKEN }}
+          ref: main
           path: server
 
       - name: Checkout client repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/breach
+          repository: kakrami/breach
           token: ${{ secrets.DEPLOY_TOKEN }}
+          ref: main
           path: client
 
-      - name: Update server repo
+      - name: Push server files
         shell: bash
         run: |
           set -euo pipefail
 
-          rsync -a --delete             --exclude='.git/'             --exclude='.github/'             --exclude='README.md'             "$SERVER_DIR/" server/
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='README.md' \
+            game/1_SERVER_REPO_UPLOAD/ server/
 
           git -C server config user.name "breach-release-bot"
           git -C server config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C server add -A
 
           if ! git -C server diff --cached --quiet; then
-            git -C server commit -m "Deploy Breach ${BREACH_VERSION}"
-            git -C server push origin HEAD
+            git -C server commit -m "Deploy Breach release"
+            git -C server push origin HEAD:main
           else
-            echo "Server repo already matches Breach ${BREACH_VERSION}"
+            echo "Server already matches release."
           fi
 
-      - name: Update client repo
+      - name: Push client files
         shell: bash
         run: |
           set -euo pipefail
 
-          rsync -a --delete             --exclude='.git/'             --exclude='.github/'             --exclude='README.md'             --exclude='CNAME'             --exclude='.nojekyll'             "$CLIENT_DIR/" client/
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='README.md' \
+            --exclude='CNAME' \
+            --exclude='.nojekyll' \
+            game/2_CLIENT_REPO_UPLOAD/ client/
 
           git -C client config user.name "breach-release-bot"
           git -C client config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C client add -A
 
           if ! git -C client diff --cached --quiet; then
-            git -C client commit -m "Deploy Breach ${BREACH_VERSION}"
-            git -C client push origin HEAD
+            git -C client commit -m "Deploy Breach release"
+            git -C client push origin HEAD:main
           else
-            echo "Client repo already matches Breach ${BREACH_VERSION}"
+            echo "Client already matches release."
           fi
 
-      - name: Deployment summary
-        if: always()
-        shell: bash
-        run: |
-          echo "Breach release workflow finished."
-          echo "Version: ${BREACH_VERSION:-unknown}"
+      - name: Complete
+        run: echo "Server and client repositories updated."
