@@ -1,0 +1,41 @@
+name: Deploy Breach Release
+
+"on":
+  push:
+    branches:
+      - main
+    paths:
+      - breach_release.zip
+  workflow_dispatch: {}
+
+concurrency:
+  group: breach-release-deploy
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release repo
+        uses: actions/checkout@v7
+        with:
+          path: release
+
+      - name: Extract and validate release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f release/breach_release.zip
+
+          rm -rf extracted
+          mkdir extracted
+          unzip -q release/breach_release.zip -d extracted
+
+          test -d extracted/1_SERVER_REPO_UPLOAD
+          test -d extracted/2_CLIENT_REPO_UPLOAD
+          test -f extracted/1_SERVER_REPO_UPLOAD/worker.js
+          test -f extracted/2_CLIENT_REPO_UPLOAD/index.html
