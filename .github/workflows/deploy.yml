@@ -15,99 +15,225 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  SERVER_REPO: kakrami/breach-online
+  CLIENT_REPO: kakrami/breach
+  AUDIO_SOURCE_COMMIT: 1833f8e8300a72fcc78efa6886138d7841f1a821
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout release repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: release
 
-      - name: Extract and validate game ZIP
+      - name: Validate release package
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f release/breach_release.zip
+          ZIP="release/breach_release.zip"
+          test -f "$ZIP"
 
           rm -rf game
           mkdir game
-          unzip -q release/breach_release.zip -d game
+          unzip -q "$ZIP" -d game
 
           test -f game/1_SERVER_REPO_UPLOAD/worker.js
+          test -f game/1_SERVER_REPO_UPLOAD/wrangler.jsonc
+          test -f game/1_SERVER_REPO_UPLOAD/game-config.js
           test -f game/2_CLIENT_REPO_UPLOAD/index.html
+          test -f game/2_CLIENT_REPO_UPLOAD/client.js
+          test -f game/2_CLIENT_REPO_UPLOAD/audio-engine.js
+          test -f game/2_CLIENT_REPO_UPLOAD/game-config.js
 
           while IFS= read -r -d '' file; do
             node --check "$file" >/dev/null
-          done < <(find game/1_SERVER_REPO_UPLOAD game/2_CLIENT_REPO_UPLOAD -name '*.js' -print0)
+          done < <(
+            find \
+              game/1_SERVER_REPO_UPLOAD \
+              game/2_CLIENT_REPO_UPLOAD \
+              -name '*.js' -print0
+          )
 
-          echo "Game ZIP validated."
+          SERVER_VERSION="$(sed -n "s/^export const APP_VERSION = '\([^']*\)';/\1/p" game/1_SERVER_REPO_UPLOAD/game-config.js)"
+          CLIENT_VERSION="$(sed -n "s/^export const APP_VERSION = '\([^']*\)';/\1/p" game/2_CLIENT_REPO_UPLOAD/game-config.js)"
+
+          SERVER_PROTOCOL="$(sed -n 's/^export const PROTOCOL_VERSION = \([0-9][0-9]*\);/\1/p' game/1_SERVER_REPO_UPLOAD/game-config.js)"
+          CLIENT_PROTOCOL="$(sed -n 's/^export const PROTOCOL_VERSION = \([0-9][0-9]*\);/\1/p' game/2_CLIENT_REPO_UPLOAD/game-config.js)"
+
+          test -n "$SERVER_VERSION"
+          test "$SERVER_VERSION" = "$CLIENT_VERSION"
+
+          test -n "$SERVER_PROTOCOL"
+          test "$SERVER_PROTOCOL" = "$CLIENT_PROTOCOL"
+
+          echo "BREACH_VERSION=$SERVER_VERSION" >> "$GITHUB_ENV"
+          echo "BREACH_PROTOCOL=$SERVER_PROTOCOL" >> "$GITHUB_ENV"
+
+          echo "Validated Breach $SERVER_VERSION, protocol $SERVER_PROTOCOL."
 
       - name: Checkout server repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
-          repository: kakrami/breach-online
+          repository: ${{ env.SERVER_REPO }}
           token: ${{ secrets.DEPLOY_TOKEN }}
           ref: main
           path: server
 
-      - name: Checkout client repo
-        uses: actions/checkout@v4
+      - name: Checkout client repo with history
+        uses: actions/checkout@v7
         with:
-          repository: kakrami/breach
+          repository: ${{ env.CLIENT_REPO }}
           token: ${{ secrets.DEPLOY_TOKEN }}
           ref: main
+          fetch-depth: 0
           path: client
 
-      - name: Push server files
+      - name: Verify push access before changing anything
         shell: bash
         run: |
           set -euo pipefail
 
-          rsync -a --delete \
+          git -C server push --dry-run origin HEAD:main
+          git -C client push --dry-run origin HEAD:main
+
+          echo "Push permission verified for both repositories."
+
+      - name: Merge release into deployment repos
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Overwrite/add release files.
+          # Never delete unrelated files already in either repository.
+          rsync -a --checksum \
             --exclude='.git/' \
             --exclude='.github/' \
-            --exclude='.gitignore' \
-            --exclude='README.md' \
             game/1_SERVER_REPO_UPLOAD/ server/
 
+          rsync -a --checksum \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            game/2_CLIENT_REPO_UPLOAD/ client/
+
+      - name: Restore and validate audio assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Confirm the last known-good audio commit is available.
+          git -C client cat-file -e "${AUDIO_SOURCE_COMMIT}^{commit}"
+
+          # The previous destructive sync removed audio/.
+          # Restore the complete directory if it is gone.
+          if [ ! -d client/audio ]; then
+            git -C client checkout "$AUDIO_SOURCE_COMMIT" -- audio
+            rm -f client/audio/.test
+
+            echo "Restored audio directory from $AUDIO_SOURCE_COMMIT."
+          fi
+
+          # Read the audio files actually required by the CURRENT client.
+          mapfile -t REQUIRED_AUDIO < <(
+            grep -oE \
+              "audio/[A-Za-z0-9._/-]+\.(wav|ogg|mp3)" \
+              client/client.js |
+            sort -u
+          )
+
+          if [ "${#REQUIRED_AUDIO[@]}" -eq 0 ]; then
+            echo "ERROR: client.js contains no audio asset references."
+            exit 1
+          fi
+
+          # Preserve existing/custom sounds.
+          # Restore only individual required sounds that are missing.
+          for asset in "${REQUIRED_AUDIO[@]}"; do
+            if [ ! -s "client/$asset" ]; then
+              mkdir -p "client/$(dirname "$asset")"
+
+              if ! git -C client show \
+                "${AUDIO_SOURCE_COMMIT}:${asset}" \
+                > "client/$asset"; then
+
+                echo "ERROR: Could not restore required audio: $asset"
+                exit 1
+              fi
+
+              echo "Restored missing $asset"
+            fi
+
+            test -s "client/$asset"
+          done
+
+          echo "Validated ${#REQUIRED_AUDIO[@]} required audio assets."
+
+      - name: Commit server update
+        shell: bash
+        run: |
+          set -euo pipefail
+
           git -C server config user.name "breach-release-bot"
-          git -C server config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C server config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
           git -C server add -A
 
           if ! git -C server diff --cached --quiet; then
-            git -C server commit -m "Deploy Breach release"
-            git -C server push origin HEAD:main
+            git -C server commit \
+              -m "Deploy Breach ${BREACH_VERSION}"
           else
-            echo "Server already matches release."
+            echo "Server already matches Breach ${BREACH_VERSION}."
           fi
 
-      - name: Push client files
+      - name: Commit client update
         shell: bash
         run: |
           set -euo pipefail
 
-          rsync -a --delete \
-            --exclude='.git/' \
-            --exclude='.github/' \
-            --exclude='.gitignore' \
-            --exclude='README.md' \
-            --exclude='CNAME' \
-            --exclude='.nojekyll' \
-            game/2_CLIENT_REPO_UPLOAD/ client/
-
           git -C client config user.name "breach-release-bot"
-          git -C client config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C client config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
           git -C client add -A
 
           if ! git -C client diff --cached --quiet; then
-            git -C client commit -m "Deploy Breach release"
-            git -C client push origin HEAD:main
+            git -C client commit \
+              -m "Deploy Breach ${BREACH_VERSION}"
           else
-            echo "Client already matches release."
+            echo "Client already matches Breach ${BREACH_VERSION}."
           fi
 
-      - name: Complete
-        run: echo "Server and client repositories updated."
+      - name: Push server
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C server push origin HEAD:main
+
+      - name: Push client
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C client push origin HEAD:main
+
+      - name: Verify both repository updates
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SERVER_SHA="$(git -C server rev-parse HEAD)"
+          CLIENT_SHA="$(git -C client rev-parse HEAD)"
+
+          git -C server ls-remote origin refs/heads/main |
+            grep -q "^${SERVER_SHA}"
+
+          git -C client ls-remote origin refs/heads/main |
+            grep -q "^${CLIENT_SHA}"
+
+          echo "Breach ${BREACH_VERSION} pushed successfully."
+          echo "Server: ${SERVER_SHA}"
+          echo "Client: ${CLIENT_SHA}"
