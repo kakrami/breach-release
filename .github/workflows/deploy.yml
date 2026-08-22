@@ -69,6 +69,7 @@ jobs:
           rsync -a --delete \
             --exclude='.git/' \
             --exclude='.github/' \
+            --exclude='.gitignore' \
             --exclude='README.md' \
             game/1_SERVER_REPO_UPLOAD/ server/
 
@@ -91,6 +92,7 @@ jobs:
           rsync -a --delete \
             --exclude='.git/' \
             --exclude='.github/' \
+            --exclude='.gitignore' \
             --exclude='README.md' \
             --exclude='CNAME' \
             --exclude='.nojekyll' \
